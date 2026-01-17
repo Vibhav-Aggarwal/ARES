@@ -1,6 +1,7 @@
 #!/bin/bash
 # ARES Router Health Monitor
 # Monitors router and reports crashes to Lab server and cloud
+# Enhanced with webhook and multi-channel alerting
 
 ROUTER_IP="10.0.0.81"
 ROUTER_ZT_IP="10.73.168.3"
@@ -8,6 +9,12 @@ LAB_SERVER="lab-server.vibhavaggarwal.com"
 CLOUD_SERVER="vibhav-home-server"
 LOG_FILE="/tmp/ares_router_monitor.log"
 ALERT_FILE="/tmp/ares_router_alerts.log"
+
+# Alert configuration (override via environment variables)
+WEBHOOK_URL="${ARES_WEBHOOK_URL:-}"
+WEBHOOK_ENABLED="${ARES_WEBHOOK_ENABLED:-false}"
+ALERT_COOLDOWN="${ARES_ALERT_COOLDOWN:-300}"  # 5 min default between alerts
+LAST_ALERT_FILE="/tmp/ares_last_alert_time"
 
 # Colors for logging
 RED='\033[0;31m'
@@ -19,16 +26,108 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a ${LOG_FILE}
 }
 
+should_send_alert() {
+    # Check if enough time has passed since last alert (cooldown)
+    if [ ! -f "${LAST_ALERT_FILE}" ]; then
+        return 0  # No previous alert, send it
+    fi
+
+    local LAST_ALERT=$(cat "${LAST_ALERT_FILE}")
+    local NOW=$(date +%s)
+    local ELAPSED=$((NOW - LAST_ALERT))
+
+    if [ "${ELAPSED}" -ge "${ALERT_COOLDOWN}" ]; then
+        return 0  # Cooldown expired, send alert
+    else
+        log "Alert cooldown active (${ELAPSED}s / ${ALERT_COOLDOWN}s)"
+        return 1  # Still in cooldown
+    fi
+}
+
+send_webhook_alert() {
+    local SEVERITY="$1"
+    local MESSAGE="$2"
+    local STATE="$3"
+
+    if [ "${WEBHOOK_ENABLED}" != "true" ] || [ -z "${WEBHOOK_URL}" ]; then
+        return
+    fi
+
+    # Determine color based on severity
+    case "${SEVERITY}" in
+        critical) COLOR="16711680" ;;  # Red
+        warning)  COLOR="16776960" ;;  # Yellow
+        info)     COLOR="65280" ;;     # Green
+        *)        COLOR="8421504" ;;   # Gray
+    esac
+
+    # Create JSON payload
+    local PAYLOAD=$(cat <<EOF
+{
+  "embeds": [{
+    "title": "🔴 ARES Router Alert",
+    "description": "${MESSAGE}",
+    "color": ${COLOR},
+    "fields": [
+      {
+        "name": "State",
+        "value": "${STATE}",
+        "inline": true
+      },
+      {
+        "name": "Router",
+        "value": "${ROUTER_IP}",
+        "inline": true
+      },
+      {
+        "name": "Timestamp",
+        "value": "$(date '+%Y-%m-%d %H:%M:%S')",
+        "inline": false
+      }
+    ],
+    "footer": {
+      "text": "ARES Router Monitor"
+    }
+  }]
+}
+EOF
+)
+
+    # Send webhook (suppress output to avoid log spam)
+    curl -s -X POST "${WEBHOOK_URL}" \
+        -H "Content-Type: application/json" \
+        -d "${PAYLOAD}" > /dev/null 2>&1
+
+    if [ $? -eq 0 ]; then
+        log "Webhook alert sent successfully"
+    else
+        log "Webhook alert failed"
+    fi
+}
+
 alert() {
     local MESSAGE="$1"
+    local SEVERITY="${2:-warning}"  # Default to warning
+
     echo -e "${RED}[ALERT]${NC} ${MESSAGE}" | tee -a ${ALERT_FILE}
     log "ALERT: ${MESSAGE}"
+
+    # Check cooldown
+    if ! should_send_alert; then
+        return
+    fi
+
+    # Update last alert time
+    date +%s > "${LAST_ALERT_FILE}"
 
     # Send alert to Lab server
     ssh ${LAB_SERVER} "echo '[$(date)] ROUTER ALERT: ${MESSAGE}' >> /tmp/ares_router_alerts.log" 2>/dev/null
 
     # Send alert to cloud server
     ssh ${CLOUD_SERVER} "echo '[$(date)] ROUTER ALERT: ${MESSAGE}' >> /tmp/ares_router_alerts.log" 2>/dev/null
+
+    # Send webhook alert if enabled
+    send_webhook_alert "${SEVERITY}" "${MESSAGE}" "${STATE:-UNKNOWN}"
 }
 
 check_router_status() {
@@ -84,17 +183,17 @@ check_router_crash() {
     # Save current state
     echo "${STATE}" > /tmp/ares_router_last_state
 
-    # Detect state transitions and alert
+    # Detect state transitions and alert with appropriate severity
     if [ "${LAST_STATE}" = "HEALTHY" ] && [ "${STATE}" = "DEGRADED" ]; then
-        alert "Router DEGRADED: Network alive but SSH down - ${DETAILS}"
+        alert "Router DEGRADED: Network alive but SSH down - ${DETAILS}" "warning"
         diagnose_crash
     elif [ "${LAST_STATE}" = "HEALTHY" ] && [ "${STATE}" = "DOWN" ]; then
-        alert "Router DOWN: Complete network failure - ${DETAILS}"
+        alert "Router DOWN: Complete network failure - ${DETAILS}" "critical"
     elif [ "${LAST_STATE}" = "DEGRADED" ] && [ "${STATE}" = "DOWN" ]; then
-        alert "Router DOWN: Degraded state escalated to complete failure - ${DETAILS}"
+        alert "Router DOWN: Degraded state escalated to complete failure - ${DETAILS}" "critical"
     elif [ "${STATE}" = "HEALTHY" ] && [ "${LAST_STATE}" != "HEALTHY" ]; then
         log "Router RECOVERED: ${LAST_STATE} → HEALTHY"
-        alert "Router RECOVERED from ${LAST_STATE}"
+        alert "Router RECOVERED from ${LAST_STATE}" "info"
     fi
 }
 
@@ -168,8 +267,15 @@ determine_crash_cause() {
 
 # Main monitoring loop
 main() {
-    log "ARES Router Monitor started"
+    log "ARES Router Monitor started (Enhanced Alerting v2.0)"
     log "Monitoring: ${ROUTER_IP} (office) | ${ROUTER_ZT_IP} (ZeroTier)"
+    log "Alert cooldown: ${ALERT_COOLDOWN}s"
+
+    if [ "${WEBHOOK_ENABLED}" = "true" ]; then
+        log "Webhook alerts: ENABLED"
+    else
+        log "Webhook alerts: DISABLED (set ARES_WEBHOOK_ENABLED=true to enable)"
+    fi
 
     while true; do
         check_router_crash
