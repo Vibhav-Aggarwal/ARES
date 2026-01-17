@@ -1,0 +1,22 @@
+# Capture files
+*.cap
+*.pcap
+*.csv
+/tmp/ares_captures/
+
+# Logs
+*.log
+
+# Temp files
+/tmp/
+*.pid
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
